@@ -1,0 +1,40 @@
+# 编译产物
+*.exe
+*.dll
+*.pdb
+*.obj
+/launcher/bin/
+/build/
+
+# 运行时与本地配置（不要提交自己的 IP / 口令）
+logs/
+*.log
+config/*.ini
+!config/*.example.ini
+启动器配置.ini
+python/
+假人部署包/
+
+# 密钥与证书
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+
+# 抓包与临时文件
+*.pcap
+*.pcapng
+*.bak
+*.bak.*
+*.tmp
+.tmp*/
+__pycache__/
+*.py[cod]
+
+# 编辑器 / 系统
+.vs/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,207 @@
+====================================================
+假人 robot 适配 85A 服务端 —— 完整记录（2026-11-04）
+====================================================
+
+说明：下文出现的 robot/xxx 均指上游项目 dnf-robot-s4a21 仓库内的相对路径；
+      本仓库不包含该项目的源码，获取方式见 README。
+      上游地址：https://github.com/zmbksyyr/dnf-robot-s4a21
+
+
+【结论】85A 的假人已经跑起来了：20 个假人全部 state=3（在村里），会走动、会喊话。
+      用的不是原来那个 S4A21 版 robot，而是用 Go 从 dnf-robot-main 源码重编的版本，改了两处。
+
+一、为什么原来的 robot 不行
+  1) 自带的 假人部署包\robot 是 2026-09-25 构建的 S4A21 专用版
+     （二进制里有 75 处 S4A21 字样），换到 85A 上表现为：
+     登录能过、收到 HELLO 后立刻断开、20 个全部 online_confirm_timeout。
+  2) 源码 <上游仓库根目录>（2026-08-25）比那个二进制还旧，
+     但用 go1.27.1 编出来后，登录链路是通的（HELLO→CMD1→选角色都成功）。
+
+二、重编后仍然进不了村，真正的两个坑
+  坑 1：背包 blob 槽位数不对（249 格 vs 服务端 289 格）
+     - 85A 的 df_game_r 里 kMainInventoryPrimaryItemCount = 289、每条 61 字节，
+       所以 taiwan_cain_2nd.inventory.inventory 解压后必须是 289*61 = 17629 字节。
+     - robot 建号时写的是 249*61 = 15189 字节（internal/scheduler/repository/repository_robot_create.go），
+       服务端按 17629 解析，多出来的格子读到脏数据 → 出现幽灵道具，
+       _verifyItem 报 error_line 5624，INVEN_VERIFY=0，直接 DisConnSig(36) 把人踢掉。
+     - 改法：inventorySlotCount 249 → 289。
+
+  坑 2：世界喇叭（item 36 x200）放错格子
+     - robot 把喇叭写在第 57 格（internal/capability/store/inventory.go 的 WorldHornRawIndex = boxIndex+2）。
+     - 85A 的槽位分区是硬校验的：装备 9~64、消耗品 65~120 …
+       第 57 格属于装备区，塞一个消耗品 → 同样报 5624 → 整包作废。
+     - 改法：WorldHornRawIndex 固定为 65（消耗品第一格）。
+
+三、现在的状态（验证过）
+  - INVEN_VERIFY result=1（之前 1048 次全是 0）
+  - ETC_ENTER 正常，随后 insert_game_world → reach_game_world → set_state(3)
+  - robot.log: [RobotMetrics] online=20 running=15 busy=5 runtime running=20
+  - 假人有坐标、在走动（move=66）、会喊话（[Shout] channel=local/world）
+
+四、怎么复现/再编
+  1) 需要 Go：<你的 Go 安装目录>（1.27.1）已装好；或双击 工具\编译robot.bat
+  2) 命令（在 <上游仓库根目录> 下）：
+       set GOOS=linux & set GOARCH=amd64
+       go build -trimpath -buildvcs=false -o ..\robot-linux .\cmd\robot
+  3) 上传覆盖 /root/robot（chmod 755），再 /root/robot 重启；
+     robot 必须有 /root/config/conf/config.ini 与 keys。
+  4) 如果假人角色是旧数据，先把 taiwan_cain_2nd.inventory 里这些 charac_no 的行删掉，
+     让 robot 用新尺寸重建（或直接用工具里的【重新部署假人】+ 面板【清理】）。
+
+五、备份与回滚
+  - 原始 S4A21 版：/root/robot.s4a21.bak-20261104-011902、/root/robot.s4a21.keep
+  - 上一版（未修喇叭）：/root/robot.prev
+  - 工具内的旧版：假人部署包\robot.s4a21.bak
+
+============================================================
+2026-11-04 晚 追加：假人「看不见」的两个真根因（已修复）
+------------------------------------------------------------
+现象：假人在线、在动、在喊，但玩家在城镇里一个都看不见。
+
+根因一：CMD36(设置区域) 的字段顺序错了
+  robot 原来按「area, before_area, village, x, y, ...」拼包，
+  而 85A 服务端 DisPatcher_SetArea::read 的真实读序是
+  「village(u8? 实际是 area 语义), ...」——源码里 world_dispatcher_runtime.cpp
+  的 read/process 字段名与语义是错位的，process 实际调用：
+    move_area(user, area→village, before_area→area,
+              village_index→x, move_index→y, move_type→direction,
+              true, 0, move_arg0→gate_village, move_arg1→gate_area)
+  正确载荷（11 字节）：
+    [0]=village  [1]=area  [2:4]=x  [4:6]=y  [6]=direction
+    [7:9]=gate_village  [9:11]=gate_area
+
+根因二（更隐蔽）：
+  buildSendPacket 里 cipher.Encrypt 要求载荷长度是加密块(16 字节)的整数倍，
+  11 字节会直接返回错误 "data not multiple of block size"，
+  而调用处没检查 err —— 包根本没发出去，服务端当然不动。
+  修法：var setArea [16]byte，补零到 16 字节（服务端只读前 11 字节）。
+
+修复后表现：假人登录进村会自动发一次区域包，并每 5 秒重发，
+  全部落到目标区域（默认 area 0），玩家在同一区域即可看见。
+
+教训：**robot 里所有 buildSendPacket 的载荷都要检查长度是否为 16 的倍数**，
+  否则会静默失败（CMD7 回选角当年的「发出去没反应」很可能同因）。
+
+当前部署包里的 robot = 2026-11-04 18:38 编译版
+  sha256 前缀 7defc47e，大小 21,441,139 字节
+  旧版备份：同目录 robot.s4a21.bak
+
+
+============================================================
+2026-11-04 晚 追加2：假人摆摊（分解机）修通
+------------------------------------------------------------
+症状：假人永远开不出摊位，日志
+  [STORE_CMD7_FALLBACK] ... return to character select timeout
+  [DISJOINT_TRY_FAILED] ... reason=disjoint_err_0x11 / ack_timeout
+
+两个根因：
+1) 建摊命令号错了。robot 发的是 CMD 238，但 85A 里
+   ENUM_CMDPACKET_COMPOUND_ITEM_BY_EXPERT_JOB = 238（合成道具），
+   ENUM_CMDPACKET_CREATE_DISJOINT_STORE = 234。
+   所以服务端把它当"合成"处理，回 0x11（道具不合法）。
+   改动：robot_store.go 里 buildSendPacket(238 → 234)。
+
+2) 成功时服务端不回包。Dispatcher_CreateDisjointStore::send()
+   只在 error_code != 0 时发错误包；成功时只向同区域广播
+   NOTI 206 (CREATE_DISJOINT_STORE)。
+   而 robot 一直在等 CMD 的应答 → ack_timeout。
+   改动：robot_packets.go 增加 case 234 → handleDisjointCreateNotifyUnsafe，
+   收到 206 通知即视为建摊成功。
+
+结果：store=6/0，[DISJOINT_SUCCESS_POINT] 陆续出现。
+注意：客户端目前把分解机画成红 X（缺贴图），属客户端资源问题。
+
+另外附带修好：
+  - 摆摊选点限制在同城镇（跨城镇的点会被服务端拒）
+  - 登录后按 uid%3 分散到 3 个区域，避免全挤在一起
+
+
+============================================================
+2026-11-05 追加：全服喇叭（NOTI 118）打通
+------------------------------------------------------------
+服务端 packet_dispatcher_send_mess_runtime.cpp 对聊天类型有硬校验：
+  chat_type 13 → 背包里必须有 item key 37（服务器喇叭）
+  chat_type 15 → 背包里必须有 item key 2660655（全服喇叭）
+  两者都不满足时 return LineFunc(32805) —— 静默丢包，客户端什么都收不到。
+
+修复 = 两件事同时做：
+  1) 给每个假人背包塞 2660655 × 500（raw 66 格，61 字节记录，
+     位置 = 4 字节小端长度 + zlib(289*61 全零) 里第 66*61 处写入）
+  2) robot 的世界喊话类型从 13 改成 15（internal/capability/robottemplate/template.go
+     的 PrepareShout world 分支）
+
+实测：改完重启 robot 后日志出现
+  [Shout] ... channel=world type=15
+玩家在聊天框「喇叭」标签页能看到假人的喊话，全服广播正常。
+
+当前部署包 robot = 2026-11-05 13:07 编译版（robot-mega15.exe，21,448,201 字节）。
+
+
+============================================================
+2026-11-05 追加：假人跨城镇漫游
+------------------------------------------------------------
+原来的 TownWanderLoop 只在当前城镇内换 area（rand.Intn(6)），
+城镇永远是登录时那一座。
+
+改法（internal/protocol/dnf/robot_movement.go 的 TownWanderLoop）：
+  · 每轮 45% 概率换城镇，城镇集合 {1,2,3}（作者默认的三座）
+  · 换城时把坐标重置到新城镇的可走范围（x 300~600 / y 180~340）
+  · 其余情况仍在当前城镇内随机换 area
+  · 每次仍然走 SetArea → CMD36（16 字节载荷，字段序 village,area,x,y,dir,gate_village,gate_area）
+
+服务端快照（Log20261105.snap，每 5 分钟一批）实测：
+  13:09:54 → 13:19:57 之间，
+  · 7 个假人换了城镇（例：17000913 村1区0 → 村3区4）
+  · 10 个假人在同一城镇内换了区
+  · 当前分布：村1 60 人 / 村2 10 人 / 村3 8 人，覆盖 (1,0)(1,1)(1,2)(2,1)(2,3)(2,5)(3,4)(3,5) 等多个区
+
+当前部署包 robot = 2026-11-05 13:17 编译版（robot-cross.exe，21,447,465 字节）。
+
+
+============================================================
+2026-11-05 追加：假人「站着不动」的真因 = visible_flags 位
+------------------------------------------------------------
+现象：假人在线、机器人侧坐标一直在变，但玩家客户端里它们站着不动。
+
+代码证据（df_game_r/src/old_game/world/region/game_world_transition_runtime.cpp:136）：
+    if (user->IsCurCharacVisible())
+        area->send_to_all(packet);   // 广播给同区域所有人
+    else
+        user->Send(packet);          // 只回给自己
+而 IsCurCharacVisible() = (visible_flag & 1)。
+
+数据库里 taiwan_cain.charac_stat.visible_flags 假人全部是 2（2 & 1 = 0 → 不可见），
+所以移动包只回给假人自己，玩家看到的是「停在原地不动」的残影。
+
+修复 SQL（一次性）：
+    UPDATE taiwan_cain.charac_stat s
+      JOIN taiwan_cain.charac_info i ON s.charac_no = i.charac_no
+       SET s.visible_flags = (s.visible_flags | 1)
+     WHERE i.m_id BETWEEN 17000000 AND 17999999;
+
+修完重启 robot（登录时才会重新读 visible_flags），玩家就能看到假人走动。
+
+
+============================================================
+2026-11-05 追加：按区域面积分配假人（大区域人多）
+------------------------------------------------------------
+需求：150 人；出生点随机；每个区域至少 1 人；区域越大的人越多、摆摊越多。
+
+实现：
+  1) 新增 internal/protocol/dnf/area_weights.go —— 由 /root/config/pvf/map_catalog.json
+     生成 80 个区域的表：{village, area, weight(=可走矩形面积), x/y 矩形, gate}
+  2) TownWanderLoop 改为：
+     · uid%3==0 的假人走「确定性轮转」→ areas[uid % len(areas)]，保证小区域也有人
+     · 其余按 weight 加权随机 → 大区域自然人多
+     · 45% 概率换城镇（1/2/3），换城后按新城的区域表重新取点
+  3) 配置：robot_config.ini 里 spawn_fixed = false（随机出生点）、
+     auto_target_online_count = 150、auto_move_interval_min/max_sec = 3/9（走动更勤）
+     注意 move_steps / move_step_delay_ms 属于 [move] 段，写进 [auto] 会启动失败
+     （robot config line N [auto] move_steps: unknown setting）
+  4) robot_uid_end 从 17000999 扩到 17004999（原来 1000 个位不够建 150 个号）
+
+实测（14:37）：150 个假人 / 131 在线 / 38 个区域有人；
+  村1区0=39、村2区0=26、村3区0=24（这三个是最大的矩形），
+  其余 35 个区域各有 1~4 人；摆摊 6 个。
+
+当前部署包 robot = robot-areas2.exe（21,455,614 字节）。

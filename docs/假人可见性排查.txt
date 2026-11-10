@@ -1,0 +1,43 @@
+假人「看不见」排查记录（2026-11-04 12:00-12:40）
+========================================
+
+一、结论
+假人确实在线、在走动、在喊话（服务端与 robot 两侧都有数据），
+但玩家的客户端**收不到任何“其他玩家出现/移动”的下行包**，所以城市里看不到人。
+不是补丁问题（PVF/NPK 换回官方城镇后地面建筑正常），也不是假人没上线。
+
+二、证据
+1) robot 侧：150 在线，state=3（在城内），move 计数持续增长（12:29 时 1898 次），
+   喊话 local/world 都有成功记录（[Shout] source=auto channel=world type=11）。
+2) 服务端侧：2 个 df_game_r 存活，无 terminate called，10011/7101/10186/8112 全在听。
+3) 客户端侧（关键）：客户端目录里的 DNFServer_Protocol.log 是观测型协议日志。
+   在城里挂机 3 分钟，RECV 只有 protocol=6 / 692 / 693 / 695（心跳）与 714（防作弊），
+   **没有任何“玩家出现/移动”类包**；SEND 只有 742/744 周期包。
+   也就是说：服务端没有把假人的存在告诉客户端。
+
+三、做过的实验
+- 把假人硬塞进玩家所在城镇+分区：改 d_starsky.dummylist 的 curvill/curarea（+ 同步
+  taiwan_cain.charac_info.village），重启 robot 后 150 个假人全部落到 village 1 / area 1
+  （即玩家所在的艾尔文防线），**依然看不到**。
+- 在一次重启瞬间，屏幕上出现过一次假人名字「天之骄子」（正压在角色身上），
+  说明客户端渲染管线本身是好的，只是常规情况下收不到广播。
+- 自动化限制：游戏用 DirectInput，keybd_event/SendInput 的方向键、点击地面都无效
+  （只有 UI 点击有效），所以我无法控制角色走动去别处验证。
+- 玩家出生城镇不由 charac_info.village 决定：把 Nero 的 village 改成 2 重新登录，
+  依然出生在艾尔文防线（已改回 1）。
+
+四、当前留下的改动（仅服务端侧，客户端未改动）
+1) d_starsky.dummylist：395 个假人的 curvill/curarea/curx/cury 被重写，
+   约 349 个落在 village 2（赫顿玛尔）的 10 个分区，其余零散。
+2) /root/config/conf/robot_config.ini：spawn_fixed=true、spawn_village=2、spawn_area=0
+   （以后新建的假人也落在赫顿玛尔）。
+   [spawn] 段其余项（spawn_x/y 范围、fallback_village=1）未动。
+3) taiwan_cain.charac_info.village：假人 uid 17000000-17000019 对应的 charac 3-22
+   之前被批量改成 2，未回滚（对可见性无影响）。
+
+五、下一步方向（待定）
+A. 服务端广播链路：对照 df_game_r 源码里 insert_game_world / send_AllBasicInfo /
+   reach_game_world 的广播对象判断，看是否对这类会话静默（可能有“假人不对玩家广播”的门控）。
+B. 客户端丢弃：appearance/avatar 数据不完整时客户端会直接不画，需要抓包看
+   服务端到底有没有发 appearance 包。
+C. 摆摊 CMD29（disjoint_failed）仍未开始。
